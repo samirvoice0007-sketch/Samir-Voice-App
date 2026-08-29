@@ -63,10 +63,15 @@ export type SessionUser = {
 type UserDoc = {
   _id: string;
   email: string;
+  /** Empty string for accounts that only ever signed in via Google/phone. */
   passwordHash: string;
   name: string;
   role: Role;
   createdAt: Date;
+  /** E.164 phone number, set for accounts created via phone OTP. */
+  phone?: string | null;
+  /** Firebase's own user id, set once an account has signed in via Google/phone at least once. */
+  firebaseUid?: string;
 };
 
 function usersCollection() {
@@ -185,6 +190,9 @@ export const signIn = createServerFn({ method: "POST" })
     const col = await usersCollection();
     const found = await col.findOne({ email: data.email });
     if (!found) throw new AuthError("Invalid email or password.", 401);
+    if (!found.passwordHash) {
+      throw new AuthError("This account uses Google or phone sign-in — no password is set.", 401);
+    }
     const ok = await bcrypt.compare(data.password, found.passwordHash);
     if (!ok) throw new AuthError("Invalid email or password.", 401);
 
@@ -206,3 +214,48 @@ export const getCurrentUser = createServerFn({ method: "GET" }).handler(
     return getSessionUser();
   },
 );
+
+const firebaseSignInSchema = z.object({ idToken: z.string().min(10) });
+
+/**
+ * Verify a Firebase ID token (from Google sign-in or phone OTP, minted
+ * client-side by `@/lib/firebase-client`) and sign in — creating the
+ * MongoDB user document on first sign-in, linking it on later ones.
+ *
+ * Matching order: existing `firebaseUid` first (repeat sign-in), then by
+ * email (lets someone who signed up with email+password later add Google
+ * without ending up with two accounts). Phone-only sign-ins with no email
+ * always create a fresh account tied to `firebaseUid`.
+ */
+export const signInWithFirebase = createServerFn({ method: "POST" })
+  .validator(firebaseSignInSchema)
+  .handler(async ({ data }): Promise<SessionUser> => {
+    const { verifyFirebaseIdToken } = await import("@/lib/firebase-admin");
+    const decoded = await verifyFirebaseIdToken(data.idToken);
+    const email = decoded.email?.toLowerCase() || "";
+
+    const col = await usersCollection();
+    let found = await col.findOne({ firebaseUid: decoded.uid });
+    if (!found && email) found = await col.findOne({ email });
+
+    if (!found) {
+      const doc: UserDoc = {
+        _id: randomUUID(),
+        email,
+        passwordHash: "",
+        name: decoded.name?.trim() || "Star",
+        role: ADMIN_EMAIL && email === ADMIN_EMAIL ? "admin" : "user",
+        createdAt: new Date(),
+        phone: decoded.phoneNumber,
+        firebaseUid: decoded.uid,
+      };
+      await col.insertOne(doc);
+      found = doc;
+    } else if (found.firebaseUid !== decoded.uid) {
+      await col.updateOne({ _id: found._id }, { $set: { firebaseUid: decoded.uid } });
+    }
+
+    const user: SessionUser = { id: found._id, email: found.email, name: found.name, role: found.role };
+    await issueSessionCookie(user);
+    return user;
+  });
