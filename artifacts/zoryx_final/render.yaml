@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: zory-x-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
+      - key: WEBHOOK_DOMAIN
+        sync: false
+      - key: MONETAG_ZONE_ID
+        sync: false
+      - key: REFERRAL_REWARD
+        value: "50"
+      - key: AD_REWARD
+        value: "20"

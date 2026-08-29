@@ -1,0 +1,32 @@
+module.exports = {
+  chooseLanguage: `🌐 Choose your language:`,
+  languageSet: `✅ Language set to English!`,
+  marketingIntro: `🚀 Task volume and earnings are skyrocketing, and the bot is running incredibly smoothly!\n\n💰 Hundreds of new tasks are rolling out daily, with some users already earning $100–$3000 a month through the bot.\n\n🎉 Open the bot and start generating your own online income today!\n\n🌐 Please select your language`,
+  welcome: (name) =>
+    `🎉 *Welcome to ZORY X BOT!*\n\nHello, ${name}!\n\n💰 Complete social media tasks to earn USDT\n📅 Daily check-in for USDT\n👥 Invite friends for up to 20% commission\n\n🚀 Invite friends to earn $100–$3000 USDT monthly\n\n👇 Tap below to start earning!`,
+  welcomeLinks: (officialChannel, communityChannel) =>
+    `🔔 Notifications ➔ ${officialChannel}\n📢 Announcements ➔ ${officialChannel}\n👥 Community ➔ ${communityChannel}\n\n⚡ Stay updated and don't miss new tasks!`,
+  openApp: `🚀 Open ZORY X BOT`,
+  changeLanguage: `🌐 Change Language`,
+  ownerHelpTitle: `🛠 *Owner Command List — ZORY X BOT*`,
+  ownerHelpBody: `/start — Start the bot & welcome message\n/help — This command list\n/announcement — Broadcast a text message to all users\n/announcementimage — Broadcast an image + text message to all users\n/addadmin <telegram_id> — Add a new admin (owner only)\n/removeadmin <telegram_id> — Remove an admin (owner only)\n/stats — Bot user/admin statistics\n/totalusers — Total users who have started the bot\n/withdrawals — List pending withdrawal requests\n/approvewithdraw <id> — Mark a withdrawal as sent\n/rejectwithdraw <id> — Reject a withdrawal and refund the balance\n\nℹ️ Tasks are added/edited from the Mini App *Earn* section.`,
+  adminHelpTitle: `🛠 *Admin Command List — ZORY X BOT*`,
+  adminHelpBody: `/announcement — Broadcast a text message to all users\n/announcementimage — Broadcast an image + text message to all users\n/totalusers — Total users who have started the bot\n/withdrawals — List pending withdrawal requests\n/approvewithdraw <id> — Mark a withdrawal as sent\n/rejectwithdraw <id> — Reject a withdrawal and refund the balance`,
+  announcementAsk: `📢 Now send your announcement message. It will be broadcast to all users.`,
+  announcementImageAsk: `🖼️ Now send the photo for your announcement.`,
+  announcementCaptionAsk: `📝 Got the photo! Now send the caption text that should go with it.`,
+  announcementButtonAsk: `🔗 Want to add a button to this message? Send the link (starting with http:// or https://), or send /nobutton to send it without a button.`,
+  announcementInvalidUrl: `⚠️ That doesn't look like a valid link. Please send a link starting with http:// or https://, or send /nobutton to skip.`,
+  announcementButtonLabel: `🔗 Open Link`,
+  announcementSending: (count) => `⏳ ${count}...`,
+  announcementDone: (sent, failed) => `✅ Sent: ${sent} / Failed: ${failed}`,
+  notAdmin: `⛔ This command is for admins only.`,
+  addAdminUsage: `Usage: /addadmin <telegram_id>`,
+  addAdminDone: (id) => `✅ ${id}`,
+  removeAdminDone: (id) => `🗑️ ${id}`,
+  stats: (users, admins, tasks) => `📊 users: ${users} | admins: ${admins} | tasks: ${tasks}`,
+  totalUsersText: (count) => `📊 Total users who have started the bot: *${count}*`,
+  checkinReminder: (streak, reward) =>
+    `📅 *Check-in Reminder*\n\n⏰ You haven't checked in today!\n🔥 Current streak: ${streak} days\n🎁 Today's reward: ${reward} USDT\n\nDon't forget to check in daily!`,
+  checkInNowBtn: `📅 Check In Now`,
+};
