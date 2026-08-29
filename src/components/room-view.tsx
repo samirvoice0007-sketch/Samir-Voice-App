@@ -1,8 +1,11 @@
+import type { IAgoraRTCClient, IMicrophoneAudioTrack } from "agora-rtc-sdk-ng";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Gift, Mic, MicOff, Send, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AvatarOrb } from "@/components/avatar-orb";
+import { getAgoraToken } from "@/lib/agora";
+import { numericUid } from "@/lib/agora-uid";
 import { useCurrentUser } from "@/lib/auth/use-current-user";
 import { GIFTS, giftById } from "@/lib/gifts";
 import { t } from "@/lib/i18n";
@@ -31,7 +34,11 @@ export function RoomView({ roomId }: { roomId: string }) {
   const [speaking, setSpeaking] = useState(false);
   const [micOn, setMicOn] = useState(false);
   const [fly, setFly] = useState<string | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  // Real Agora voice — replaces the old local-mic-only visualizer.
+  const clientRef = useRef<IAgoraRTCClient | null>(null);
+  const localTrackRef = useRef<IMicrophoneAudioTrack | null>(null);
+  const [remoteSpeaking, setRemoteSpeaking] = useState<Set<number>>(new Set());
+  const [canPublish, setCanPublish] = useState(false);
 
   const roomQ = useQuery({
     queryKey: ["room", roomId],
@@ -45,13 +52,75 @@ export function RoomView({ roomId }: { roomId: string }) {
   });
   const meQ = useQuery({ queryKey: ["me"], queryFn: () => getMyProfile() });
 
+  // My own role in this room, as the server sees it (source of truth for
+  // whether I'm allowed to publish audio — a promotion via takeSeat() shows
+  // up here once roomQ refetches).
+  const myRole = useMemo(
+    () => roomQ.data?.members.find((m) => m.userId === user?.id)?.role ?? "listener",
+    [roomQ.data, user?.id],
+  );
+
   useEffect(() => {
     void joinRoom({ data: { roomId } }).then(() => qc.invalidateQueries({ queryKey: ["room", roomId] }));
     return () => {
       void leaveRoom({ data: { roomId } });
-      streamRef.current?.getTracks().forEach((tr) => tr.stop());
     };
   }, [roomId, qc]);
+
+  // Join/leave the actual Agora voice channel once per room, and again
+  // whenever my publish permission changes (e.g. I take a seat) — a token's
+  // publish/subscribe role is fixed at join time, so a promotion needs a
+  // fresh token + rejoin, not just a local flag flip.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function connect() {
+      const { default: AgoraRTC } = await import("agora-rtc-sdk-ng");
+      const { appId, channel, uid, token, canPublish: publishAllowed } = await getAgoraToken({ data: { roomId } });
+      if (cancelled) return;
+
+      const client = AgoraRTC.createClient({ mode: "live", codec: "vp8" });
+      clientRef.current = client;
+      await client.setClientRole(publishAllowed ? "host" : "audience");
+
+      client.enableAudioVolumeIndicator();
+      client.on("volume-indicator", (volumes) => {
+        setRemoteSpeaking((prev) => {
+          const next = new Set(prev);
+          for (const v of volumes) {
+            if (v.level > 15) next.add(v.uid as number);
+            else next.delete(v.uid as number);
+          }
+          return next;
+        });
+      });
+      client.on("user-published", async (remoteUser, mediaType) => {
+        await client.subscribe(remoteUser, mediaType);
+        if (mediaType === "audio") remoteUser.audioTrack?.play();
+      });
+
+      await client.join(appId, channel, token, uid);
+      if (cancelled) {
+        await client.leave();
+        return;
+      }
+      setCanPublish(publishAllowed);
+    }
+
+    void connect();
+    return () => {
+      cancelled = true;
+      const client = clientRef.current;
+      clientRef.current = null;
+      localTrackRef.current?.close();
+      localTrackRef.current = null;
+      setMicOn(false);
+      setSpeaking(false);
+      void client?.leave();
+    };
+    // Re-run on role change (listener -> speaker/host) so the client
+    // rejoins with a publish-capable token.
+  }, [roomId, myRole]);
 
   const seats = useMemo(() => {
     const members = roomQ.data?.members ?? [];
@@ -59,31 +128,31 @@ export function RoomView({ roomId }: { roomId: string }) {
   }, [roomQ.data]);
 
   async function toggleMic() {
+    const client = clientRef.current;
     if (micOn) {
-      streamRef.current?.getTracks().forEach((tr) => tr.stop());
-      streamRef.current = null;
+      const track = localTrackRef.current;
+      if (client && track) await client.unpublish([track]);
+      track?.close();
+      localTrackRef.current = null;
       setMicOn(false);
       setSpeaking(false);
       await setMuted({ data: { roomId, muted: true } });
       void qc.invalidateQueries({ queryKey: ["room", roomId] });
       return;
     }
+    if (!client || !canPublish) return; // not a speaker/host yet — take a seat first
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      const { default: AgoraRTC } = await import("agora-rtc-sdk-ng");
+      const track = await AgoraRTC.createMicrophoneAudioTrack();
+      localTrackRef.current = track;
+      await client.publish([track]);
       setMicOn(true);
       await setMuted({ data: { roomId, muted: false } });
-      const ctx = new AudioContext();
-      const src = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
-      src.connect(analyser);
-      const data = new Uint8Array(analyser.frequencyBinCount);
+
       const loop = () => {
-        analyser.getByteFrequencyData(data);
-        const avg = data.reduce((a, b) => a + b, 0) / data.length;
-        setSpeaking(avg > 18);
-        if (streamRef.current) requestAnimationFrame(loop);
+        if (!localTrackRef.current) return;
+        setSpeaking(localTrackRef.current.getVolumeLevel() > 0.15);
+        requestAnimationFrame(loop);
       };
       loop();
       void qc.invalidateQueries({ queryKey: ["room", roomId] });
@@ -116,6 +185,11 @@ export function RoomView({ roomId }: { roomId: string }) {
     await nav({ to: "/" });
   }
 
+  async function onTakeSeat(i: number) {
+    await takeSeat({ data: { roomId, seat: i } });
+    void qc.invalidateQueries({ queryKey: ["room", roomId] });
+  }
+
   if (!roomQ.data) {
     return <div className="grid min-h-dvh place-items-center bg-bg text-muted">{t(lang, "loading")}</div>;
   }
@@ -139,32 +213,36 @@ export function RoomView({ roomId }: { roomId: string }) {
       </header>
 
       <div className="grid grid-cols-4 gap-3 px-4 pt-6">
-        {seats.map((person, i) => (
-          <button
-            key={i}
-            type="button"
-            onClick={() => {
-              if (person) setTarget(person.userId);
-              else void takeSeat({ data: { roomId, seat: i } }).then(() => qc.invalidateQueries({ queryKey: ["room", roomId] }));
-            }}
-            className="flex flex-col items-center gap-1"
-          >
-            {person ? (
-              <AvatarOrb
-                name={person.displayName}
-                hue={person.avatarHue}
-                live={person.userId === user?.id ? speaking && micOn : !person.muted}
-              />
-            ) : (
-              <div className="grid h-12 w-12 place-items-center rounded-full border border-dashed border-border text-[10px] text-muted">
-                {t(lang, "emptySeat")}
-              </div>
-            )}
-            <span className="max-w-16 truncate text-[10px] text-muted">
-              {person ? person.displayName : t(lang, "takeSeat")}
-            </span>
-          </button>
-        ))}
+        {seats.map((person, i) => {
+          const isMe = person?.userId === user?.id;
+          const live = person
+            ? isMe
+              ? speaking && micOn
+              : remoteSpeaking.has(numericUid(person.userId)) && !person.muted
+            : false;
+          return (
+            <button
+              key={i}
+              type="button"
+              onClick={() => {
+                if (person) setTarget(person.userId);
+                else void onTakeSeat(i);
+              }}
+              className="flex flex-col items-center gap-1"
+            >
+              {person ? (
+                <AvatarOrb name={person.displayName} hue={person.avatarHue} live={live} />
+              ) : (
+                <div className="grid h-12 w-12 place-items-center rounded-full border border-dashed border-border text-[10px] text-muted">
+                  {t(lang, "emptySeat")}
+                </div>
+              )}
+              <span className="max-w-16 truncate text-[10px] text-muted">
+                {person ? person.displayName : t(lang, "takeSeat")}
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       <div className="mt-4 flex-1 overflow-y-auto px-4 pb-2">
@@ -190,8 +268,13 @@ export function RoomView({ roomId }: { roomId: string }) {
           <button
             type="button"
             onClick={toggleMic}
-            className={cn("grid h-12 w-12 place-items-center rounded-full", micOn ? "bg-primary" : "bg-elevated text-muted")}
+            disabled={!canPublish}
+            className={cn(
+              "grid h-12 w-12 place-items-center rounded-full disabled:opacity-40",
+              micOn ? "bg-primary" : "bg-elevated text-muted",
+            )}
             aria-label={micOn ? t(lang, "micOn") : t(lang, "micOff")}
+            title={!canPublish ? (lang === "bn" ? "কথা বলতে একটা সিট নাও" : "Take a seat to talk") : undefined}
           >
             {micOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
           </button>
@@ -261,4 +344,4 @@ export function RoomView({ roomId }: { roomId: string }) {
       ) : null}
     </div>
   );
-}
+                       }
