@@ -1,261 +1,208 @@
-/**
- * Self-hosted Better Auth for THIS app (server-only).
- *
- * Pre-wired for live preview + deploy — do not rewrite this file. To enable
- * local email/password, flip the flag in `./email-password` only (see auth skill).
- *
- * The app runs its own Better Auth at `/api/auth/*`, so the session cookie stays
- * on this app's own origin. Sign-in federates to the shared **Grok auth broker**
- * (`GROK_AUTH_ISSUER`) via the `genericOAuth` plugin — the broker brokers the
- * upstream sign-in methods (Google, X, …) and holds their shared secrets; this
- * app only holds its own client id/secret and names the upstream it wants via
- * each provider's `idp` hint.
- *
- * Tri-mode:
- *   - Deployed: the deployer injects a per-app `GROK_AUTH_*` + `BETTER_AUTH_URL`
- *     + `DATABASE_URL`, so real federated auth is persisted in Postgres.
- *   - Sandbox live preview: no injection -> falls back to the shared **preview
- *     client** (`./preview`) and derives the preview's `https://*.grok-sandbox.com`
- *     origin from the request, so real sign-in works (no demo users). Sessions
- *     and identities persist in the embedded PGLite DB (same DB as app data);
- *     the process restart wipes both. Live-preview iframe clients use a bearer
- *     token (partitioned cookies) — see `client.ts`.
- *   - Off (`VITE_AUTH_ENABLED=false`, the shipped default): no providers;
- *     `requireUserId` resolves a dev user with no database configured, and
- *     throws fail-closed once `DATABASE_URL` is set (see `verify.server.ts`).
- *
- * NEVER import this from client code — it pulls in `pg` + the preview secret +
- * server-only Better Auth internals. The client uses `@/lib/auth/client`;
- * components read the user via `@/lib/auth/use-current-user`; server functions get
- * a verified id via `@/lib/auth/middleware`.
- */
-import { betterAuth } from "better-auth";
-import { bearer, genericOAuth } from "better-auth/plugins";
-import { tanstackStartCookies } from "better-auth/tanstack-start";
-import { getCookie } from "@tanstack/react-start/server";
-import { randomBytes } from "node:crypto";
-import { Pool } from "pg";
-import { ensureDbReady, getPglite } from "../db";
-import { emailAndPasswordEnabled } from "./email-password";
-import { GATE_PROVIDER_ID, gateIdentitySessions } from "./gate-session.server";
-import { GROK_PROVIDERS } from "./providers";
-import { pgliteDialect } from "./pglite-dialect";
-import {
-  GROK_ISSUER_DEFAULT,
-  PREVIEW_ALLOWED_HOSTS,
-  PREVIEW_CLIENT_ID,
-  PREVIEW_CLIENT_SECRET,
-} from "./preview";
-
-// Kick (and share) PGLite bootstrap as soon as the auth server module loads.
-void ensureDbReady();
+import { randomUUID } from "node:crypto";
+import { createServerFn } from "@tanstack/react-start";
+import { setCookie } from "@tanstack/react-start/server";
+import { SignJWT, jwtVerify } from "jose";
+import bcrypt from "bcryptjs";
+import { z } from "zod";
+import { getCollection } from "@/lib/db";
 
 /**
- * Preview secret must outlive module reloads: PGLite (and its session rows) is
- * stored on `globalThis`, so an HMR re-eval of this file must NOT mint a new
- * signing secret or every existing session becomes invalid mid-dev. Process
- * restart clears both the secret and PGLite together.
+ * Self-hosted email/password auth (server-only) — replaces the old
+ * Better-Auth-via-Grok-broker setup.
+ *
+ * Sessions are a signed JWT (via `jose`, HS256, secret = `JWT_SECRET`) stored
+ * in an httpOnly cookie. There is no separate "session table" — the cookie
+ * IS the session, and it's stateless: revoking a session means rotating
+ * `JWT_SECRET` (which logs everyone out) rather than deleting a DB row.
+ *
+ * Required server env vars (Render → Environment):
+ *   JWT_SECRET        - long random string, signs every session token
+ *   JWT_EXPIRES_IN    - e.g. "30d" (also used as the cookie's maxAge)
+ *   ADMIN_EMAIL       - optional: this email always logs in as role "admin"
+ *   ADMIN_PASSWORD    - required if ADMIN_EMAIL is set
  */
-const globalAuthRef = globalThis as typeof globalThis & {
-  __grokAuthPreviewSecret__?: string;
-};
-function previewAuthSecret(): string {
-  globalAuthRef.__grokAuthPreviewSecret__ ??= randomBytes(32).toString("hex");
-  return globalAuthRef.__grokAuthPreviewSecret__;
+
+export const SESSION_COOKIE = "session";
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN?.trim() || "30d";
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
+/** True once a real `JWT_SECRET` is configured. Every route in this app expects this to be true — there is no "auth disabled" mode anymore. */
+export const authConfigured = Boolean(JWT_SECRET);
+
+function secretKey(): Uint8Array {
+  if (!JWT_SECRET) {
+    throw new Error(
+      "JWT_SECRET is not set. Add it as a server environment variable (Render → Environment) — never hard-code it.",
+    );
+  }
+  return new TextEncoder().encode(JWT_SECRET);
 }
 
-/** Read an env var, treating empty/whitespace as unset. */
-const env = (key: string): string | undefined => {
-  const value = process.env[key]?.trim();
-  return value ? value : undefined;
+/** Turns "30d" / "12h" / "3600s" / "45m" into seconds, for the cookie's maxAge. Falls back to 30 days if unparsable. */
+function expiresInToSeconds(value: string): number {
+  const match = /^(\d+)\s*(s|m|h|d)?$/.exec(value.trim());
+  if (!match) return 30 * 24 * 60 * 60;
+  const amount = Number(match[1]);
+  const unit = (match[2] ?? "s") as "s" | "m" | "h" | "d";
+  const secondsPerUnit = { s: 1, m: 60, h: 3600, d: 86400 } as const;
+  return amount * secondsPerUnit[unit];
+}
+
+export type Role = "user" | "admin";
+
+export type SessionUser = {
+  id: string;
+  email: string;
+  name: string;
+  role: Role;
 };
 
-// Explicit off-switch. The deployer sets `VITE_AUTH_ENABLED=true` when it
-// provisions auth; set it to "false" to force auth off everywhere (dev user).
-const authDisabled = env("VITE_AUTH_ENABLED") === "false";
-
-// Broker federation creds: the deployer injects a per-app client when deployed;
-// otherwise fall back to the shared live-preview client, which the broker accepts
-// for any `*.grok-sandbox.com` callback (see `./preview`).
-const grokIssuer = env("GROK_AUTH_ISSUER") ?? GROK_ISSUER_DEFAULT;
-const grokClientId = env("GROK_AUTH_CLIENT_ID") ?? PREVIEW_CLIENT_ID;
-const grokClientSecret = env("GROK_AUTH_CLIENT_SECRET") ?? PREVIEW_CLIENT_SECRET;
-
-/** True when federated sign-in is active (real auth is enforced). */
-export const authConfigured =
-  !authDisabled && Boolean(grokClientId && grokClientSecret);
-
-// This app's own Better Auth origin. When deployed the deployer injects the
-// public URL. In the sandbox live preview there's no fixed URL (each preview gets
-// a dynamic `*.grok-sandbox.com` host), so we hand Better Auth a dynamic baseURL:
-// it derives the origin per-request from the (proxied) host, validated against the
-// preview allowlist, which makes the OAuth `redirect_uri` the concrete preview URL
-// the broker's preview client accepts.
-const explicitBaseURL = env("BETTER_AUTH_URL");
-// Explicit `string[]` (not a readonly tuple) — Better Auth's DynamicBaseURLConfig
-// requires a mutable `allowedHosts: string[]`.
-const previewAllowedHosts: string[] = [...PREVIEW_ALLOWED_HOSTS];
-// Local `npm run dev` (port 8080 contract). Browsers may send Origin as any of
-// these for the same server — trusting only `localhost` rejects `127.0.0.1` and
-// breaks email/password with "Invalid origin".
-const LOCAL_DEV_ORIGINS: string[] = [
-  "http://localhost:8080",
-  "http://127.0.0.1:8080",
-  "http://[::1]:8080",
-];
-const baseURL = explicitBaseURL ?? {
-  // Include loopback hosts so dynamic baseURL resolves for local email/password
-  // (not only the preview wildcard).
-  allowedHosts: [...previewAllowedHosts, "localhost", "127.0.0.1", "[::1]"],
-  // `auto` → trust both http:// and https:// expansions of allowedHosts
-  // (preview is https; local dev is http).
-  protocol: "auto" as const,
-  fallback: "http://localhost:8080",
+type UserDoc = {
+  _id: string;
+  email: string;
+  passwordHash: string;
+  name: string;
+  role: Role;
+  createdAt: Date;
 };
 
-// Origins Better Auth accepts on credentialed POSTs (sign-up/sign-in, etc.).
-// Missing entries here surface as FORBIDDEN "Invalid origin".
-const trustedOrigins: string[] = explicitBaseURL
-  ? [explicitBaseURL, ...LOCAL_DEV_ORIGINS]
-  : [
-      // Host wildcards (matched against Origin's host)
-      ...previewAllowedHosts,
-      // Full-origin wildcards (matched against Origin)
-      ...previewAllowedHosts.flatMap((host) => [`https://${host}`, `http://${host}`]),
-      ...LOCAL_DEV_ORIGINS,
-    ];
+function usersCollection() {
+  return getCollection<UserDoc>("users");
+}
 
-const databaseUrl = env("DATABASE_URL");
+/** Thrown for any expected auth failure (bad credentials, duplicate email, ...). Carries an HTTP-ish `status` so callers can map it to a response code. */
+export class AuthError extends Error {
+  readonly status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "AuthError";
+    this.status = status;
+  }
+}
 
-// Static broker OAuth endpoints (skip OIDC discovery on every sign-in / callback).
-// Discovery would cost an extra network hop to the broker before the popup can
-// even redirect to Google/X — the live-preview popup felt stuck on the app for
-// that whole round-trip. These paths match the broker's discovery document.
-const issuerBase = grokIssuer.replace(/\/+$/, "");
-const grokAuthorizationUrl = `${issuerBase}/api/auth/oauth2/authorize`;
-const grokTokenUrl = `${issuerBase}/api/auth/oauth2/token`;
-const grokUserInfoUrl = `${issuerBase}/api/auth/oauth2/userinfo`;
+/** Sign a session JWT for `user` and set it as an httpOnly cookie on the current response. */
+async function issueSessionCookie(user: SessionUser): Promise<void> {
+  const token = await new SignJWT({ email: user.email, name: user.name, role: user.role })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(user.id)
+    .setIssuedAt()
+    .setExpirationTime(JWT_EXPIRES_IN)
+    .sign(secretKey());
 
-// Real Postgres when `DATABASE_URL` is set (deployed apps), else the app's
-// embedded PGLite (preview) via a Kysely dialect — so Better Auth persists to the
-// SAME DB as app data, including email/password users. Both use the Better Auth
-// schema from `migrations/auth/0001_auth.sql`, copied into `migrations/` when
-// the app turns sign-in on.
-const database = databaseUrl
-  ? new Pool({ connectionString: databaseUrl })
-  : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
+  setCookie(SESSION_COOKIE, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: expiresInToSeconds(JWT_EXPIRES_IN),
+  });
+}
 
-/** Session token cookie name — also read by the live-preview popup completion page. */
-export const SESSION_TOKEN_COOKIE = "__Host-grok-auth.session_token";
+/** Clear the session cookie (sign-out). */
+function clearSessionCookie(): void {
+  setCookie(SESSION_COOKIE, "", {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: 0,
+  });
+}
 
-// Built separately so the `betterAuth({...})` call stays easy to edit without
-// breaking brackets (models often trip on the conditional plugin spread).
-const grokOAuthPlugin = authConfigured
-  ? genericOAuth({
-      config: GROK_PROVIDERS.map(({ providerId, idp }) => ({
-        providerId,
-        clientId: grokClientId as string,
-        clientSecret: grokClientSecret as string,
-        // Prefer static endpoints over `discoveryUrl` so initiating (and
-        // completing) OAuth does not wait on a broker discovery fetch.
-        authorizationUrl: grokAuthorizationUrl,
-        tokenUrl: grokTokenUrl,
-        userInfoUrl: grokUserInfoUrl,
-        scopes: ["openid", "profile", "email"],
-        // `prompt: "login"` forces the broker to re-authenticate against the
-        // upstream on every sign-in instead of silently reusing an existing
-        // broker session. Combined with the broker sending Google
-        // `prompt=select_account`, the user always gets the account chooser
-        // and can pick (or switch) which account to sign in with.
-        authorizationUrlParams: { idp, prompt: "login" },
-      })),
-    })
-  : null;
+/** Verify a session JWT (as read from the cookie) and return its payload, or `null` if missing/invalid/expired. Never throws. */
+export async function verifySessionToken(token: string | undefined | null): Promise<SessionUser | null> {
+  if (!token) return null;
+  try {
+    const { payload } = await jwtVerify(token, secretKey());
+    if (typeof payload.sub !== "string") return null;
+    return {
+      id: payload.sub,
+      email: typeof payload.email === "string" ? payload.email : "",
+      name: typeof payload.name === "string" ? payload.name : "",
+      role: payload.role === "admin" ? "admin" : "user",
+    };
+  } catch {
+    return null;
+  }
+}
 
-export const auth = betterAuth({
-  baseURL,
-  // Deployed apps inject BETTER_AUTH_SECRET. Preview: process-stable secret on
-  // globalThis so HMR doesn't invalidate PGLite-backed sessions (see above).
-  secret: env("BETTER_AUTH_SECRET") ?? previewAuthSecret(),
-  database,
-
-  // CSRF / origin check for credentialed auth POSTs (email sign-up/sign-in, …).
-  // See `trustedOrigins` construction above — must cover live preview hosts AND
-  // local loopback variants, or clients get "Invalid origin".
-  trustedOrigins,
-
-  // Encrypt broker-issued OAuth tokens at rest, and treat the broker's upstreams
-  // as trusted first-party identities. The broker owns identity and X emails are
-  // synthetic/unverified, so WITHOUT this a login can fail with
-  // `account_not_linked` (Better Auth refuses to attach an untrusted, unverified
-  // identity to an existing user). Google and X carry DISTINCT emails, so this
-  // never merges them into one user — they stay separate identities.
-  account: {
-    encryptOAuthTokens: true,
-    accountLinking: {
-      enabled: true,
-      trustedProviders: [
-        ...GROK_PROVIDERS.map((p) => p.providerId),
-        GATE_PROVIDER_ID,
-      ],
-      // X's synthetic email is never "verified", so don't gate linking on the
-      // local user's email-verified state.
-      requireLocalEmailVerified: false,
-    },
-  },
-
-  // Cache the session in the short-lived signed `session_data` cookie so reads
-  // (incl. the client's `/get-session`) skip the DB — this shrinks the "loading"
-  // window and reduces auth flicker. See the `auth` skill for the full
-  // flicker-prevention guidance (gate on `isPending`; SSR the session).
-  session: { cookieCache: { enabled: true, maxAge: 300 } },
-
-  // Local email/password — toggled only via `./email-password` (not a plugin).
-  ...(emailAndPasswordEnabled ? { emailAndPassword: { enabled: true } } : {}),
-
-  // `__Host-` prefixed cookies: the browser REFUSES any same-named cookie that
-  // carries a `Domain` attribute, so a sibling `*.grok.me` app cannot "toss" a
-  // `Domain=.grok.me` session cookie onto this app. `__Host-` requires Secure +
-  // Path=/ + no Domain; Better Auth otherwise uses `__Secure-` (which permits
-  // Domain), so we drop its auto prefix (`useSecureCookies: false`) and set
-  // Secure + the names ourselves. (Browsers allow Secure cookies on
-  // `http://localhost`, so local dev still works.)
-  advanced: {
-    useSecureCookies: false,
-    defaultCookieAttributes: { secure: true, sameSite: "lax", path: "/" },
-    cookies: {
-      session_token: { name: SESSION_TOKEN_COOKIE },
-      session_data: { name: "__Host-grok-auth.session_data" },
-      account_data: { name: "__Host-grok-auth.account_data" },
-      dont_remember: { name: "__Host-grok-auth.dont_remember" },
-    },
-  },
-
-  plugins: [
-    gateIdentitySessions(),
-
-    // One genericOAuth provider per upstream (when auth is on), all federating
-    // to the broker with the SAME client and differing only by the `idp` hint.
-    ...(grokOAuthPlugin ? [grokOAuthPlugin] : []),
-
-    // Accept `Authorization: Bearer <session-token>` as an alternative to the
-    // cookie. Needed for the LIVE PREVIEW: the app runs in an embedded iframe
-    // where cookies are partitioned, so after popup sign-in it authenticates with
-    // a bearer token instead (see `client.ts` / the `auth` skill). The hook only
-    // fires when an Authorization header is present, so the cookie path
-    // (deployed apps) is unaffected.
-    bearer(),
-
-    // Bridges Better Auth's Set-Cookie into TanStack Start responses. MUST be
-    // last so it runs after every other plugin's hooks.
-    tanstackStartCookies(),
-  ],
+const emailPasswordSchema = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  password: z.string().min(8).max(200),
 });
 
-export function readSessionToken(): string | null {
-  return getCookie(SESSION_TOKEN_COOKIE) ?? null;
-}
+const signUpSchema = emailPasswordSchema.extend({
+  name: z.string().trim().max(60).optional(),
+});
 
-// Re-exported for convenience; the array lives in the dependency-free
-// `providers.ts` so the client can import it too.
-export { GROK_PROVIDERS } from "./providers";
+/** Create an account, sign it in (sets the cookie), and return the new user. */
+export const signUp = createServerFn({ method: "POST" })
+  .validator(signUpSchema)
+  .handler(async ({ data }): Promise<SessionUser> => {
+    const col = await usersCollection();
+    const existing = await col.findOne({ email: data.email });
+    if (existing) throw new AuthError("An account with this email already exists.", 409);
+
+    const passwordHash = await bcrypt.hash(data.password, 12);
+    const doc: UserDoc = {
+      _id: randomUUID(),
+      email: data.email,
+      passwordHash,
+      name: data.name?.trim() || "Star",
+      role: ADMIN_EMAIL && data.email === ADMIN_EMAIL ? "admin" : "user",
+      createdAt: new Date(),
+    };
+    await col.insertOne(doc);
+
+    const user: SessionUser = { id: doc._id, email: doc.email, name: doc.name, role: doc.role };
+    await issueSessionCookie(user);
+    return user;
+  });
+
+/**
+ * Verify credentials and sign in (sets the cookie).
+ *
+ * `ADMIN_EMAIL`/`ADMIN_PASSWORD` are a hard-coded operator shortcut: signing
+ * in with that exact email checks the password against the env var directly,
+ * no MongoDB user document required. Keep this pair out of normal sign-up
+ * (the `signUp` handler above already reserves that email for the admin
+ * role, but does not let anyone create it without knowing `ADMIN_PASSWORD`
+ * — enforce that at the UI level by not exposing sign-up for that email).
+ */
+export const signIn = createServerFn({ method: "POST" })
+  .validator(emailPasswordSchema)
+  .handler(async ({ data }): Promise<SessionUser> => {
+    if (ADMIN_EMAIL && ADMIN_PASSWORD && data.email === ADMIN_EMAIL) {
+      if (data.password !== ADMIN_PASSWORD) throw new AuthError("Invalid email or password.", 401);
+      const admin: SessionUser = { id: "admin", email: ADMIN_EMAIL, name: "Admin", role: "admin" };
+      await issueSessionCookie(admin);
+      return admin;
+    }
+
+    const col = await usersCollection();
+    const found = await col.findOne({ email: data.email });
+    if (!found) throw new AuthError("Invalid email or password.", 401);
+    const ok = await bcrypt.compare(data.password, found.passwordHash);
+    if (!ok) throw new AuthError("Invalid email or password.", 401);
+
+    const user: SessionUser = { id: found._id, email: found.email, name: found.name, role: found.role };
+    await issueSessionCookie(user);
+    return user;
+  });
+
+/** Clear the session cookie. */
+export const signOut = createServerFn({ method: "POST" }).handler(async () => {
+  clearSessionCookie();
+  return { ok: true } as const;
+});
+
+/** Resolve the caller's session from their cookie, or `null` if signed out. Used by the browser (via `./client`) to answer "who am I" on page load. */
+export const getCurrentUser = createServerFn({ method: "GET" }).handler(
+  async (): Promise<SessionUser | null> => {
+    const { getSessionUser } = await import("./verify.server");
+    return getSessionUser();
+  },
+);
