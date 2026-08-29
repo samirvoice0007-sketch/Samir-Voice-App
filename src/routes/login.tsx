@@ -1,19 +1,40 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, type ConfirmationResult } from "react";
 import { LangToggle } from "@/components/lang-toggle";
-import { AuthError, signIn, signUp } from "@/lib/auth/client";
+import {
+  AuthError,
+  confirmPhoneOtp,
+  requestPhoneOtp,
+  signIn,
+  signInWithGoogle,
+  signUp,
+} from "@/lib/auth/client";
 import { t } from "@/lib/i18n";
 import { useLang } from "@/lib/lang-store";
 
 export const Route = createFileRoute("/login")({ component: Login });
 
+const RECAPTCHA_CONTAINER_ID = "recaptcha-container";
+
+function errorMessage(error: unknown): string {
+  return error instanceof AuthError ? error.message : "Something went wrong. Try again.";
+}
+
 function Login() {
   const lang = useLang((s) => s.lang);
   const nav = useNavigate();
+
+  // Email + password
   const [mode, setMode] = useState<"in" | "up">("in");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+
+  // Phone OTP
+  const [phone, setPhone] = useState("");
+  const [otp, setOtp] = useState("");
+  const [confirmation, setConfirmation] = useState<ConfirmationResult | null>(null);
+
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -29,7 +50,49 @@ function Login() {
       }
       await nav({ to: "/" });
     } catch (error) {
-      setErr(error instanceof AuthError ? error.message : "Something went wrong. Try again.");
+      setErr(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onGoogle() {
+    setErr("");
+    setBusy(true);
+    try {
+      await signInWithGoogle();
+      await nav({ to: "/" });
+    } catch (error) {
+      setErr(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onSendOtp(e: React.FormEvent) {
+    e.preventDefault();
+    setErr("");
+    setBusy(true);
+    try {
+      const result = await requestPhoneOtp(phone, RECAPTCHA_CONTAINER_ID);
+      setConfirmation(result);
+    } catch (error) {
+      setErr(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onVerifyOtp(e: React.FormEvent) {
+    e.preventDefault();
+    if (!confirmation) return;
+    setErr("");
+    setBusy(true);
+    try {
+      await confirmPhoneOtp(confirmation, otp);
+      await nav({ to: "/" });
+    } catch (error) {
+      setErr(errorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -46,6 +109,83 @@ function Login() {
             <p className="mt-1 text-sm text-muted">{t(lang, "tagline")}</p>
           </div>
           <LangToggle />
+        </div>
+
+        {/* Firebase's invisible reCAPTCHA mounts here — must stay in the DOM. */}
+        <div id={RECAPTCHA_CONTAINER_ID} />
+
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onGoogle}
+          className="w-full rounded-2xl border border-border bg-elevated px-4 py-3 text-sm font-semibold hover:border-gold/50 disabled:opacity-60"
+        >
+          {lang === "bn" ? "Google দিয়ে চালিয়ে যান" : "Continue with Google"}
+        </button>
+
+        <div className="flex items-center gap-3 text-xs text-muted">
+          <span className="h-px flex-1 bg-border" />
+          {lang === "bn" ? "অথবা ফোন OTP" : "or phone OTP"}
+          <span className="h-px flex-1 bg-border" />
+        </div>
+
+        {!confirmation ? (
+          <form onSubmit={onSendOtp} className="space-y-3">
+            <label className="block text-xs text-muted">
+              {lang === "bn" ? "ফোন নাম্বার" : "Phone number"}
+              <input
+                type="tel"
+                required
+                placeholder="+8801XXXXXXXXX"
+                className="mt-1 w-full rounded-xl border border-border bg-elevated px-3 py-3 text-sm text-fg outline-none focus:border-primary"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                autoComplete="tel"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={busy}
+              className="w-full rounded-2xl border border-border bg-elevated py-3 text-sm font-semibold disabled:opacity-60"
+            >
+              {lang === "bn" ? "কোড পাঠান" : "Send code"}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={onVerifyOtp} className="space-y-3">
+            <label className="block text-xs text-muted">
+              {lang === "bn" ? "SMS কোড" : "SMS code"}
+              <input
+                type="text"
+                inputMode="numeric"
+                required
+                className="mt-1 w-full rounded-xl border border-border bg-elevated px-3 py-3 text-sm text-fg outline-none focus:border-primary"
+                value={otp}
+                onChange={(e) => setOtp(e.target.value)}
+                autoComplete="one-time-code"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={busy}
+              className="w-full rounded-2xl bg-primary py-3 text-sm font-semibold text-fg disabled:opacity-80"
+            >
+              {lang === "bn" ? "যাচাই করুন" : "Verify"}
+            </button>
+            <button
+              type="button"
+              className="w-full text-center text-xs text-muted underline-offset-4 hover:underline"
+              onClick={() => setConfirmation(null)}
+            >
+              {lang === "bn" ? "নাম্বার পরিবর্তন করুন" : "Use a different number"}
+            </button>
+          </form>
+        )}
+
+        <div className="flex items-center gap-3 text-xs text-muted">
+          <span className="h-px flex-1 bg-border" />
+          {lang === "bn" ? "অথবা ইমেইল" : "or email"}
+          <span className="h-px flex-1 bg-border" />
         </div>
 
         <form onSubmit={onEmail} className="space-y-3">
@@ -104,4 +244,4 @@ function Login() {
       </div>
     </main>
   );
-}
+    }
