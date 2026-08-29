@@ -3,8 +3,9 @@ import {
   GoogleAuthProvider,
   RecaptchaVerifier,
   getAuth,
+  getRedirectResult,
   signInWithPhoneNumber,
-  signInWithPopup,
+  signInWithRedirect,
   type ConfirmationResult,
 } from "firebase/auth";
 
@@ -45,11 +46,26 @@ function firebaseAuth() {
   return getAuth(firebaseApp());
 }
 
-/** Open the Google sign-in popup and return a Firebase ID token for the server to verify. */
-export async function signInWithGooglePopup(): Promise<string> {
+/**
+ * Navigate to Google's own sign-in page (redirect flow). This is used
+ * instead of a popup because mobile browsers routinely block popups or
+ * mishandle them — redirect works everywhere. The browser leaves this page;
+ * there is nothing to await here.
+ */
+export async function startGoogleRedirect(): Promise<void> {
   const provider = new GoogleAuthProvider();
-  const result = await signInWithPopup(firebaseAuth(), provider);
-  return result.user.getIdToken();
+  await signInWithRedirect(firebaseAuth(), provider);
+}
+
+/**
+ * Call once on every page load (see `@/lib/auth/client`). If the page was
+ * just reached because Google sent the user back after `startGoogleRedirect`,
+ * returns a Firebase ID token to exchange for our session. Otherwise
+ * (normal page load) returns `null` — cheap and safe to call unconditionally.
+ */
+export async function consumeGoogleRedirectResult(): Promise<string | null> {
+  const result = await getRedirectResult(firebaseAuth());
+  return result ? result.user.getIdToken() : null;
 }
 
 let recaptchaVerifier: RecaptchaVerifier | null = null;
