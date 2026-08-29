@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useState, type ConfirmationResult } from "react";
+import { useEffect, useState, type ConfirmationResult } from "react";
 import { LangToggle } from "@/components/lang-toggle";
 import {
   AuthError,
@@ -9,6 +9,7 @@ import {
   signInWithGoogle,
   signUp,
 } from "@/lib/auth/client";
+import { useCurrentUser } from "@/lib/auth/use-current-user";
 import { t } from "@/lib/i18n";
 import { useLang } from "@/lib/lang-store";
 
@@ -23,6 +24,14 @@ function errorMessage(error: unknown): string {
 function Login() {
   const lang = useLang((s) => s.lang);
   const nav = useNavigate();
+  const currentUser = useCurrentUser();
+
+  // Covers the Google redirect flow: the browser leaves for Google's page
+  // and comes back to this same /login route once signed in — as soon as
+  // the session resolves, move on to the app.
+  useEffect(() => {
+    if (currentUser) void nav({ to: "/" });
+  }, [currentUser, nav]);
 
   // Email + password
   const [mode, setMode] = useState<"in" | "up">("in");
@@ -60,11 +69,9 @@ function Login() {
     setErr("");
     setBusy(true);
     try {
-      await signInWithGoogle();
-      await nav({ to: "/" });
+      await signInWithGoogle(); // navigates the browser to Google — code after this won't run
     } catch (error) {
       setErr(errorMessage(error));
-    } finally {
       setBusy(false);
     }
   }
