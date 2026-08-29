@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { sendPhoneOtp, signInWithGooglePopup, type ConfirmationResult } from "@/lib/firebase-client";
+import { consumeGoogleRedirectResult, sendPhoneOtp, startGoogleRedirect, type ConfirmationResult } from "@/lib/firebase-client";
 import {
   AuthError,
   getCurrentUser,
@@ -44,12 +44,31 @@ async function refreshSession(): Promise<void> {
   }
 }
 
+/**
+ * On every page load: first check whether we just got sent back here after
+ * a Google redirect sign-in (see `startGoogleRedirect`) — if so, finish
+ * that sign-in. Otherwise fall back to the normal "who am I" cookie check.
+ */
+async function initSession(): Promise<void> {
+  try {
+    const idToken = await consumeGoogleRedirectResult();
+    if (idToken) {
+      const user = await signInWithFirebase({ data: { idToken } });
+      setUser(user);
+      return;
+    }
+  } catch {
+    // fall through to the normal session check below
+  }
+  await refreshSession();
+}
+
 // Kick off the initial session check once, in the browser only. This module
 // also loads during SSR (it's imported by dual client/server components),
-// but there's no point fetching there — the SSR render just shows the
+// but there's no point checking there — the SSR render just shows the
 // pending state briefly, then the browser resolves the real session.
 if (typeof window !== "undefined") {
-  void refreshSession();
+  void initSession();
 }
 
 /** Hook: current session user + loading state. Prefer `useCurrentUserState()` in `./use-current-user`, which normalizes the shape for the rest of the app. */
@@ -77,12 +96,9 @@ export async function signOut(): Promise<void> {
   setUser(null);
 }
 
-/** Open the Google popup, then exchange the resulting Firebase token for our own session cookie. */
-export async function signInWithGoogle(): Promise<SessionUser> {
-  const idToken = await signInWithGooglePopup();
-  const user = await signInWithFirebase({ data: { idToken } });
-  setUser(user);
-  return user;
+/** Navigate to Google's sign-in page. The browser leaves this page — the result is picked up automatically on the next page load (see `initSession` above). */
+export function signInWithGoogle(): Promise<void> {
+  return startGoogleRedirect();
 }
 
 /**
@@ -102,4 +118,4 @@ export async function confirmPhoneOtp(confirmation: ConfirmationResult, code: st
   const user = await signInWithFirebase({ data: { idToken } });
   setUser(user);
   return user;
-}
+  }
