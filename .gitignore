@@ -1,0 +1,12 @@
+node_modules/
+.output/
+.vercel/
+.tanstack/
+.vinxi/
+dist/
+.env
+.env.*
+!.env.example
+.project_id
+.github_repo
+*.log
