@@ -122,13 +122,17 @@ function Login() {
 
   return (
     <AppFrame>
-      <main className="relative min-h-dvh overflow-hidden px-4 pb-10 pt-6">
+      {/* Moved outside the clipped <main>: an overflow-hidden ancestor was clipping the
+          reCAPTCHA challenge overlay off-screen, so it could never be solved and always
+          timed out. Fixed positioning + a high z-index keeps it visible and unclipped. */}
+      <div id={RECAPTCHA_CONTAINER_ID} className="fixed left-1/2 top-4 z-50 -translate-x-1/2" />
+      <main className="relative min-h-dvh px-4 pb-10 pt-6">
         <div
-          className="pointer-events-none absolute -left-10 -top-6 h-44 w-44 rounded-full"
+          className="pointer-events-none absolute -left-10 -top-6 h-44 w-44 rounded-full overflow-hidden"
           style={{ background: "color-mix(in oklab, var(--color-primary) 35%, transparent)", filter: "blur(40px)" }}
         />
         <div
-          className="pointer-events-none absolute -right-8 bottom-24 h-40 w-40 rounded-full"
+          className="pointer-events-none absolute -right-8 bottom-24 h-40 w-40 rounded-full overflow-hidden"
           style={{ background: "color-mix(in oklab, var(--color-gold) 25%, transparent)", filter: "blur(40px)" }}
         />
         <div className="relative flex items-start justify-between gap-3">
@@ -138,8 +142,6 @@ function Login() {
           </div>
           <LangToggle />
         </div>
-
-        <div id={RECAPTCHA_CONTAINER_ID} />
 
         <div className="relative mt-8 flex flex-col gap-3">
           <button
@@ -264,4 +266,4 @@ function Login() {
       </main>
     </AppFrame>
   );
-}
+    }
